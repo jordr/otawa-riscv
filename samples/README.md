@@ -9,4 +9,4 @@ I used the following GCC compilers:
 
 To prevent RCV instructions (with riscv64), a dedicated prolog is used
 for standalone executable with the following options:
-	start.s -nostartfiles -march=rv64g
+	start.s -nostartfiles -march=rv64g -static -g3
