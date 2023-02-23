@@ -23,12 +23,12 @@
 #include <otawa/proc/ProcessorPlugin.h>
 #include <otawa/hard.h>
 #include <otawa/program.h>
-#include <gel/gel.h>
-#include <gel/gel_elf.h>
-#include <gel/debug_line.h>
 #include <otawa/prog/sem.h>
 #include <otawa/prog/Loader.h>
 #include <elm/stree/MarkerBuilder.h>
+
+#include <gel++.h>
+#include <gel++/DebugLine.h>
 
 extern "C" {
 #	include <riscv/grt.h>
@@ -150,14 +150,14 @@ public:
 	:	otawa::Process(manager, props),
 	 	_start(0),
 	 	oplatform(pf),
-	 	_platform(0),
-		_memory(0),
-		_decoder(0),
-		map(0),
-		_file(0),
+	 	_platform(nullptr),
+		_memory(nullptr),
+		_decoder(nullptr),
+		_file(nullptr),
+		_lines(nullptr),
 		argc(0),
-		argv(0),
-		envp(0),
+		argv(nullptr),
+		envp(nullptr),
 		no_stack(true),
 		init(false)
 	{
@@ -180,7 +180,6 @@ public:
 		argc = ARGC(props);
 		if (argc < 0)
 			argc = 1;
-		argv = ARGV(props);
 		if (!argv)
 			argv = default_argv;
 		else
@@ -204,7 +203,7 @@ public:
 		riscv_delete_decoder(_decoder);
 		riscv_unlock_platform(_platform);
 		if(_file)
-			gel_close(_file);
+			delete _file;
 	}
 
 	// Process overloads
@@ -223,95 +222,86 @@ public:
 		addFile(file);
 
 		// build the environment
-		gel_env_t genv = *gel_default_env();
-		genv.argv = argv;
-		genv.envp = envp;
-		if(no_stack)
-			genv.flags = GEL_ENV_NO_STACK;
+		gel::Parameter params;
+		cstring a[argc];
+		for(int i = 0; i < argc; i++)
+			a[i] = argv[i];
+		params.arg = Array<cstring>(argc, a);
+		int c = 0;
+		for(int i = 0; envp[i] != nullptr; i++);
+		cstring e[c];
+		for(int i = 0; i < c; i++)
+			e[i] = envp[i];
+		params.env = Array<cstring>(c, e);
+		params.stack_alloc = !no_stack;
 
-		// build the GEL image
-		_file = gel_open(path.chars(), NULL, GEL_OPEN_QUIET);
-		if(!_file)
-			throw LoadException(_ << "cannot load \"" << path << "\": " << gel_strerror());
-		gel_image_t *gimage = gel_image_load(_file, &genv, 0);
-		if(!gimage) {
-			gel_close(_file);
-			throw LoadException(_ << "cannot build image of \"" << path << "\": " << gel_strerror());
-		}
+		try {
 
-		// build the GLISS image
-		gel_image_info_t iinfo;
-		gel_image_infos(gimage, &iinfo);
-		for(t::uint32 i = 0; i < iinfo.membersnum; i++) {
-			gel_cursor_t cursor;
-			gel_block2cursor(iinfo.members[i], &cursor);
-			if(gel_cursor_avail(cursor) > 0)
-				riscv_mem_write(_memory,
-					gel_cursor_vaddr(cursor),
-					gel_cursor_addr(&cursor),
-					gel_cursor_avail(cursor));
-		}
+			// build the GEL image
+			_file = gel::Manager::open(path);
+			auto image = _file->make(params);
 
-		// cleanup image
-		gel_image_close(gimage);
+			// build the segments
+			for(auto seg: image->segments()) {
 
-		// build segments
-		gel_file_info_t infos;
-		gel_file_infos(_file, &infos);
-		for (int i = 0; i < infos.sectnum; i++) {
-			gel_sect_info_t infos;
-			gel_sect_t *sect = gel_getsectbyidx(_file, i);
-			ASSERT(sect);
-			gel_sect_infos(sect, &infos);
-			if(infos.flags & SHF_ALLOC) {
-				int flags = 0;
-				if(infos.flags & SHF_EXECINSTR)
+				// build the segment
+				t::uint32 flags = 0;
+				if(seg->isExecutable())
 					flags |= Segment::EXECUTABLE;
-				if(infos.flags & SHF_WRITE)
+				if(seg->isWritable())
 					flags |= Segment::WRITABLE;
-				if(infos.type == SHT_PROGBITS)
+				else if(seg->hasContent())
 					flags |= Segment::INITIALIZED;
-				Segment *seg = new Segment(*this, infos.name, infos.vaddr, infos.size, flags);
-				file->addSegment(seg);
-			}
-		}
+				auto *oseg = new Segment(*this,
+					seg->name(), seg->baseAddress(), seg->size(), flags);
+				file->addSegment(oseg);
 
-		// Initialize symbols
-		gel_sym_iter_t iter;
-		gel_sym_t *sym;
-		for(sym = gel_sym_first(&iter, _file); sym; sym = gel_sym_next(&iter)) {
 
-			// get the symbol description
-			gel_sym_info_t infos;
-			gel_sym_infos(sym, &infos);
-
-			// compute the kind
-			Symbol::kind_t kind = Symbol::NONE;
-			t::uint32 mask = 0xffffffff;
-			switch(ELF32_ST_TYPE(infos.info)) {
-			case STT_FUNC:
-				kind = Symbol::FUNCTION;
-				mask = 0xfffffffe;
-				break;
-			case STT_NOTYPE:
-				kind = Symbol::LABEL;
-				break;
-			case STT_OBJECT:
-				kind = Symbol::DATA;
-				break;
-			default:
-				continue;
+				// set the memory
+				auto buf = seg->buffer();
+				riscv_mem_write(_memory,
+					seg->baseAddress(),
+					buf.bytes(),
+					buf.size());
 			}
 
-			// build the label if required
-			String label(infos.name);
-			Symbol *symbol = new Symbol(*file, label, kind, infos.vaddr & mask, infos.size);
-			file->addSymbol(symbol);
-		}
+			// build the symbols
+			for(auto sym: _file->symbols()) {
 
-		// Last initializations
-		_start = findInstAt(Address(infos.entry));
-		return file;
+				// compute kind
+				Symbol::kind_t kind = Symbol::NONE;
+				t::uint32 mask = 0xffffffff;
+				switch(sym->type()) {
+					case gel::Symbol::FUNC:
+					kind = Symbol::FUNCTION;
+					mask = 0xfffffffe;
+					break;
+					case gel::Symbol::OTHER_TYPE:
+					kind = Symbol::LABEL;
+					break;
+				case gel::Symbol::DATA:
+					kind = Symbol::DATA;
+					break;
+				default:
+					continue;
+				}
+
+				// build the symbol
+				Symbol *osym = new Symbol(*file, sym->name(),
+					kind, sym->value() & mask, sym->size());
+				file->addSymbol(osym);
+			}
+
+			// clean up
+			delete image;
+
+			// last initializations
+			_start = findInstAt(_file->entry());
+			return file;
+		}
+		catch(gel::Exception& e) {
+			throw LoadException(_ << "cannot load \"" << path << "\": " << e.message());
+		}
 	}
 
 	otawa::Inst *decode(Address addr) {
@@ -329,40 +319,35 @@ public:
 		return result;
 	}
 
-	virtual gel_file_t *file(void) const { return _file; }
+	virtual gel::File *file() const { return _file; }
 	virtual riscv_memory_t *memory(void) const { return _memory; }
 	inline riscv_decoder_t *decoder() const { return _decoder; }
 	inline void *platform(void) const { return _platform; }
 
 	virtual Option<Pair<cstring, int> > getSourceLine(Address addr) {
 		setup_debug();
-		if (!map)
+		if (_lines == nullptr)
 			return none;
-		const char *file;
-		int line;
-		if (!map || gel_line_from_address(map, addr.offset(), &file, &line) < 0)
+		auto l = _lines->lineAt(addr.offset());
+		if(l == nullptr)
 			return none;
-		return some(pair(cstring(file), line));
+		return some(pair(
+			l->file()->path().toString().toCString(),
+			l->line()));
 	}
 
 	virtual void getAddresses(cstring file, int line, Vector<Pair<Address, Address> >& addresses) {
 		setup_debug();
 		addresses.clear();
-		if (!map)
+		if(_lines == nullptr)
 			return;
-		gel_line_iter_t iter;
-		gel_location_t loc, ploc = { 0, 0, 0, 0 };
-		// TODO		Not very performant but it works.
-		for (loc = gel_first_line(&iter, map); loc.file; loc = gel_next_line(&iter)) {
-			cstring lfile = loc.file;
-			if (file == loc.file || lfile.endsWith(file)) {
-				if (t::uint32(line) == loc.line)
-					addresses.add(pair(Address(loc.low_addr), Address(loc.high_addr)));
-				else if(loc.file == ploc.file && t::uint32(line) > ploc.line && t::uint32(line) < loc.line)
-					addresses.add(pair(Address(ploc.low_addr), Address(ploc.high_addr)));
-			}
-			ploc = loc;
-		}
+		auto f = _lines->files().get(file);
+		if(!f)
+			return;
+		Vector<Pair<gel::address_t, gel::address_t>> res;
+		(*f)->find(line, res);
+		for(auto a: res)
+			addresses.add(pair(Address(a.fst), Address(a.snd)));
 	}
 
 	virtual void get(Address at, t::int8& val)
@@ -437,7 +422,7 @@ private:
 		if(init)
 			return;
 		init = true;
-		map = gel_new_line_map(_file);
+		_lines = _file->debugLines();
 	}
 
 	otawa::Inst *_start;
@@ -445,8 +430,8 @@ private:
 	riscv_platform_t *_platform;
 	riscv_memory_t *_memory;
 	riscv_decoder_t *_decoder;
-	gel_line_map_t *map;
-	gel_file_t *_file;
+	gel::File *_file;
+	gel::DebugLine *_lines;
 	int argc;
 	char **argv, **envp;
 	bool no_stack;
